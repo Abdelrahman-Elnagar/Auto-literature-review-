@@ -11,7 +11,6 @@ from collections import defaultdict
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
-import threading
 
 # Load environment variables
 load_dotenv()
@@ -30,90 +29,32 @@ DEFAULT_INPUT_CSV = os.path.join(OUTPUT_DIR, "meta_learning_related_work.csv")
 DEFAULT_OUTPUT_FILE = os.path.join(OUTPUT_DIR, "literature_review.md")
 
 # Rate limiting configuration
-RATE_LIMIT_DELAY = 1  # Reduced from 2 to 1 second
-MAX_RETRIES = 3  # Reduced from 5 to 3
-RETRY_DELAY = 10  # Reduced from 15 to 10 seconds
-MAX_TOKENS_PER_MINUTE = 60000
-TOKEN_COUNT_PER_CALL = 1000
-BATCH_SIZE = 3  # Process themes in batches
+RATE_LIMIT_DELAY = 3  # Delay between API calls in seconds
+MAX_RETRIES = 4  # Maximum number of retries for API calls
+RETRY_DELAY = 10  # Delay between retries in seconds
 
 # Configure Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
 
-# Token tracking for rate limiting
-class TokenTracker:
-    def __init__(self, max_tokens_per_minute):
-        self.max_tokens_per_minute = max_tokens_per_minute
-        self.tokens_used = 0
-        self.last_reset_time = time.time()
-        self.lock = threading.Lock()
-        self.batch_tokens = 0  # Track tokens for current batch
-    
-    def can_make_request(self, estimated_tokens):
-        with self.lock:
-            current_time = time.time()
-            # Reset counter if a minute has passed
-            if current_time - self.last_reset_time >= 60:
-                self.tokens_used = 0
-                self.batch_tokens = 0
-                self.last_reset_time = current_time
-            
-            # Check if we can make the request
-            if self.tokens_used + estimated_tokens <= self.max_tokens_per_minute:
-                self.tokens_used += estimated_tokens
-                self.batch_tokens += estimated_tokens
-                return True
-            return False
-    
-    def wait_if_needed(self, estimated_tokens):
-        with self.lock:
-            if not self.can_make_request(estimated_tokens):
-                # Calculate wait time until next reset
-                wait_time = 60 - (time.time() - self.last_reset_time)
-                if wait_time > 0:
-                    logger.info(f"Token limit reached. Waiting {wait_time:.2f} seconds for reset...")
-                    time.sleep(wait_time)
-                    self.tokens_used = 0
-                    self.batch_tokens = 0
-                    self.last_reset_time = time.time()
-                    self.tokens_used += estimated_tokens
-                    self.batch_tokens += estimated_tokens
-
-# Initialize token tracker
-token_tracker = TokenTracker(MAX_TOKENS_PER_MINUTE)
-
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=RETRY_DELAY))
 def call_gemini_api(prompt, generation_config, safety_settings):
     """
     Call Gemini API with retry logic and rate limiting.
-    - Uses token-based rate limiting to avoid quota exhaustion
-    - Implements exponential backoff for retries
-    - Tracks token usage across calls
     """
     try:
-        # Estimate tokens in the prompt (rough approximation)
-        estimated_tokens = len(prompt.split()) * 1.3  # Rough estimate
-        
-        # Wait if we're approaching the token limit
-        token_tracker.wait_if_needed(estimated_tokens)
-        
-        # Make the API call
         response = model.generate_content(
             prompt,
             generation_config=generation_config,
             safety_settings=safety_settings
         )
-        
-        # Add a small delay between calls
-        time.sleep(RATE_LIMIT_DELAY)
+        time.sleep(RATE_LIMIT_DELAY)  # Rate limiting delay
         return response
     except Exception as e:
-        if "quota" in str(e).lower() or "resource exhausted" in str(e).lower():
+        if "quota" in str(e).lower():
             logger.warning("API quota limit reached. Waiting before retry...")
-            # Force a longer wait on quota errors
-            time.sleep(RETRY_DELAY * 2)
+            time.sleep(RETRY_DELAY)  # Wait longer for quota issues
             raise  # Retry through decorator
         raise
 
@@ -252,13 +193,7 @@ def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) 
     """Generate analysis for a specific theme using Gemini."""
     try:
         # Create a structured representation of the theme data
-        # Limit the size of the theme data to avoid token limits
-        limited_theme_data = {}
-        for key, papers in theme_data.items():
-            # Take only the first 3 papers for each category to save tokens
-            limited_theme_data[key] = papers[:3] if len(papers) > 3 else papers
-        
-        theme_summary = json.dumps(limited_theme_data, indent=2)
+        theme_summary = json.dumps(theme_data, indent=2)
         
         prompt = f"""
         You are an expert researcher in meta-learning. Write a comprehensive analysis of the papers grouped under the theme "{theme_name}".
@@ -281,7 +216,6 @@ def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) 
         4. Ensure all claims are supported by the paper data
         5. Use clear transitions between ideas
         6. Keep citations in IEEE format [n]
-        7. Be concise to save tokens
         
         Begin your analysis directly without any preamble.
         """
@@ -305,105 +239,18 @@ def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) 
         logger.error(f"Error generating theme analysis: {str(e)}")
         return f"Error analyzing theme {theme_name}: {str(e)}"
 
-def preprocess_paper_text(text: str) -> str:
-    """
-    Preprocess paper text to remove unnecessary content while preserving in-text citations.
-    
-    Args:
-        text: Raw text from the paper
-        
-    Returns:
-        Cleaned text with unnecessary sections removed but in-text citations preserved
-    """
-    if not text:
-        return ""
-    
-    # Create a copy of the text to avoid modifying the original
-    cleaned_text = text
-    
-    # Remove reference section (but keep in-text citations)
-    reference_patterns = [
-        r"(?i)references\s*\[?\d*\]?\s*$.*",  # References at the end
-        r"(?i)bibliography\s*\[?\d*\]?\s*$.*",  # Bibliography at the end
-        r"(?i)references\s*\[?\d*\]?\s*\n.*",  # References followed by newline
-        r"(?i)bibliography\s*\[?\d*\]?\s*\n.*",  # Bibliography followed by newline
-    ]
-    
-    for pattern in reference_patterns:
-        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
-    
-    # Remove acknowledgments section
-    ack_patterns = [
-        r"(?i)acknowledgments?\s*$.*",
-        r"(?i)acknowledgments?\s*\n.*",
-    ]
-    
-    for pattern in ack_patterns:
-        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
-    
-    # Remove appendix sections
-    appendix_patterns = [
-        r"(?i)appendix\s*[A-Za-z0-9]*\s*$.*",
-        r"(?i)appendix\s*[A-Za-z0-9]*\s*\n.*",
-    ]
-    
-    for pattern in appendix_patterns:
-        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
-    
-    # Remove excessive whitespace
-    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-    
-    # Remove page numbers and headers/footers
-    cleaned_text = re.sub(r'\n\s*\d+\s*\n', '\n', cleaned_text)
-    
-    return cleaned_text.strip()
-
-def preprocess_paper_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Preprocess paper data to clean up text fields before sending to the API.
-    
-    Args:
-        df: DataFrame containing paper information
-        
-    Returns:
-        DataFrame with preprocessed text fields
-    """
-    # Create a copy to avoid modifying the original
-    processed_df = df.copy()
-    
-    # Preprocess text fields that might contain references or unnecessary content
-    text_fields = [
-        "Simple Summary", 
-        "Key Findings/Contributions", 
-        "Meta-Feature Generation Process",
-        "Limitations"
-    ]
-    
-    for field in text_fields:
-        if field in processed_df.columns:
-            processed_df[field] = processed_df[field].apply(
-                lambda x: preprocess_paper_text(x) if isinstance(x, str) and x != "Not explicitly mentioned" else x
-            )
-    
-    return processed_df
-
 def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
     """Generate a complete literature review with different sections."""
     try:
-        # Preprocess paper data to clean up text fields
-        processed_df = preprocess_paper_data(df)
-        
         # Group papers by themes
-        themed_papers = group_papers_by_themes(processed_df)
+        themed_papers = group_papers_by_themes(df)
         
         # Convert DataFrame to a format suitable for the prompt
-        # Limit the size of the papers data to avoid token limits
-        limited_df = processed_df.head(5)  # Reduced from 10 to 5 papers for the introduction
-        papers_json = limited_df.to_json(orient='records', indent=2)
+        papers_json = df.to_json(orient='records', indent=2)
         
         # Generate introduction with rate limiting
         intro_prompt = f"""
-        Write a concise academic introduction for a literature review on meta-learning approaches in algorithm selection.
+        Write an academic introduction for a literature review on meta-learning approaches in algorithm selection.
         
         Use this paper data to inform your writing:
         {papers_json}
@@ -421,8 +268,6 @@ def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
         4. Start directly with the content
         5. Focus on clarity and flow
         6. No need for abstract or keywords
-        7. Be concise to save tokens
-        8. Keep it under 300 words
         
         Begin your introduction directly without any preamble.
         """
@@ -445,7 +290,7 @@ def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
             "Introduction": introduction
         }
         
-        # Process themes in batches
+        # Process each theme with delays between calls
         theme_sections = [
             ("Evolution of Meta-Learning Methods", "Evolution of Meta-Learning", themed_papers["meta_learning_methods"]),
             ("Algorithm Selection Strategies", "Algorithm Selection", themed_papers["algorithm_selection"]),
@@ -453,22 +298,14 @@ def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
             ("Trends and Future Directions", "Trends", themed_papers["publication_years"])
         ]
         
-        for i in range(0, len(theme_sections), BATCH_SIZE):
-            batch = theme_sections[i:i + BATCH_SIZE]
-            logger.info(f"Processing theme batch {i//BATCH_SIZE + 1}/{(len(theme_sections) + BATCH_SIZE - 1)//BATCH_SIZE}")
-            
-            for section_title, theme_name, theme_data in batch:
-                logger.info(f"Generating section: {section_title}")
-                sections[section_title] = generate_theme_analysis(theme_name, theme_data)
-            
-            # Add a delay between batches instead of between individual sections
-            if i + BATCH_SIZE < len(theme_sections):
-                logger.info(f"Waiting between theme batches...")
-                time.sleep(RATE_LIMIT_DELAY * 2)
+        for section_title, theme_name, theme_data in theme_sections:
+            logger.info(f"Generating section: {section_title}")
+            sections[section_title] = generate_theme_analysis(theme_name, theme_data)
+            time.sleep(RATE_LIMIT_DELAY)
         
         # Generate conclusion with rate limiting
         conclusion_prompt = f"""
-        Write a concise conclusion for this meta-learning literature review.
+        Write a conclusion for this meta-learning literature review.
         
         Previous sections:
         {json.dumps(sections, indent=2)}
@@ -485,8 +322,6 @@ def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
         3. Make clear recommendations
         4. Connect back to the introduction
         5. End with a strong closing statement
-        6. Be concise to save tokens
-        7. Keep it under 200 words
         
         Begin your conclusion directly without any preamble.
         """
