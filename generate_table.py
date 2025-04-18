@@ -12,17 +12,16 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from transformers import AutoTokenizer, AutoModel
 import torch
 from torch import nn
 import torch.nn.functional as F
 from typing import List, Dict, Any, Tuple
+
+# Import the standalone clustering module
+from paper_clustering import cluster_papers, save_cluster_analysis
 
 # Load environment variables
 load_dotenv()
@@ -34,46 +33,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+import os
+import sys
+import fitz  # PyMuPDF
+import pandas as pd
+from tqdm import tqdm
+import re
+import logging
+from pathlib import Path
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+import requests
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Import the standalone clustering module
+from paper_clustering import cluster_papers, save_cluster_analysis
 
-# Model and generation configuration
-GENERATION_CONFIG = {
-    "temperature": 0.3,  # More focused and precise
-    "top_p": 0.8,
-    "top_k": 40,
-    "max_output_tokens": 2048,
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configure OpenRouter API
+API_KEY ="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"
+API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+headers = {
+    'Authorization': f'Bearer {API_KEY}',
+    'Content-Type': 'application/json',
+    'HTTP-Referer': 'https://your-domain.com',  # Required by OpenRouter
+    'X-Title': 'Research Paper Analyzer'  # Custom header for identification
 }
 
-SAFETY_SETTINGS = [
-    {
-        "category": "HARM_CATEGORY_HARASSMENT",
-        "threshold": "BLOCK_NONE",
-    },
-    {
-        "category": "HARM_CATEGORY_HATE_SPEECH",
-        "threshold": "BLOCK_NONE",
-    },
-    {
-        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        "threshold": "BLOCK_NONE",
-    },
-    {
-        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-        "threshold": "BLOCK_NONE",
-    },
-]
-
-# Initialize the model
-model = genai.GenerativeModel('gemini-1.5-pro')
+# Model configuration
+MODEL_NAME = "deepseek/deepseek-chat:free"
+GENERATION_CONFIG = {
+    "temperature": 0.3,
+    "top_p": 0.8,
+    "max_tokens": 2048,
+}
 
 # Rate limiting configuration
-RATE_LIMIT_DELAY = 1  # Delay between API calls in seconds (reduced from 2)
-MAX_RETRIES = 4 # Maximum number of retries for API calls
+RATE_LIMIT_DELAY = 1  # Delay between API calls in seconds
+MAX_RETRIES = 4
 INITIAL_RETRY_DELAY = 5  # Initial delay before first retry (in seconds)
 MAX_RETRY_DELAY = 40  # Maximum delay between retries (in seconds)
 
@@ -81,36 +89,37 @@ MAX_RETRY_DELAY = 40  # Maximum delay between retries (in seconds)
     stop=stop_after_attempt(MAX_RETRIES),
     wait=wait_exponential(multiplier=INITIAL_RETRY_DELAY, max=MAX_RETRY_DELAY)
 )
-def call_gemini_api(prompt, generation_config=None, safety_settings=None):
+def call_deepseek_api(prompt: str) -> str:
     """
-    Call Gemini API with optimized retry logic and rate limiting.
-    - Uses 1 second delay between normal calls
-    - Uses exponential backoff starting at 5 seconds for retries
-    - Maximum retry delay capped at 20 seconds
+    Call DeepSeek API through OpenRouter with optimized retry logic and rate limiting.
     """
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config or GENERATION_CONFIG,
-            safety_settings=safety_settings or SAFETY_SETTINGS
-        )
-        time.sleep(RATE_LIMIT_DELAY)  # Short delay between successful calls
-        return response
+        data = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            **GENERATION_CONFIG
+        }
+        
+        response = requests.post(API_URL, json=data, headers=headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        time.sleep(RATE_LIMIT_DELAY)
+        return result['choices'][0]['message']['content']
+    
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"HTTP error occurred: {http_err}")
+        if response.status_code == 429:
+            logger.warning("Rate limit exceeded. Retrying...")
+            raise
+        raise
     except Exception as e:
-        if "quota" in str(e).lower():
-            logger.warning(f"API quota limit reached. Retrying with exponential backoff (max {MAX_RETRY_DELAY}s)...")
-            raise  # Retry through decorator with exponential backoff
+        logger.error(f"API call failed: {str(e)}")
         raise
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
     Extract text from a PDF file using PyMuPDF.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        
-    Returns:
-        Extracted text as a string
     """
     try:
         doc = fitz.open(pdf_path)
@@ -123,8 +132,8 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         logger.error(f"Error extracting text from {pdf_path}: {str(e)}")
         return ""
 
-def extract_paper_info_with_gemini(text: str, filename: str) -> dict:
-    """Extract structured information from paper text using Gemini API."""
+def extract_paper_info(text: str, filename: str) -> dict:
+    """Extract structured information from paper text using DeepSeek API."""
     extracted_info = {
         "filename": filename,
         "extraction_status": "success",
@@ -146,421 +155,107 @@ def extract_paper_info_with_gemini(text: str, filename: str) -> dict:
     }
     
     try:
-        # First, try to extract basic information (title, authors, year)
+        # Extract basic information
         basic_info_prompt = f"""
         Extract ONLY the paper's title, authors, and publication year from this text.
-        
-        RESPOND ONLY WITH THIS EXACT JSON STRUCTURE:
+        Respond with JSON using this exact structure:
         {{
             "Paper Title": "exact title or 'Not explicitly mentioned'",
             "Authors": "author names or 'Not explicitly mentioned'",
             "Year of Publication": "year or 'Not explicitly mentioned'"
         }}
-
         Text to analyze:
         {text[:5000]}
-
-        DO NOT include any other text or explanation. ONLY the JSON object is allowed.
         """
         
-        try:
-            basic_info_response = call_gemini_api(basic_info_prompt)
-            if basic_info_response and hasattr(basic_info_response, 'text'):
-                # Clean and parse the response
-                clean_text = basic_info_response.text.strip()
-                clean_text = re.sub(r'^[^{]*', '', clean_text)  # Remove any text before {
-                clean_text = re.sub(r'[^}]*$', '', clean_text)  # Remove any text after }
-                
-                try:
-                    basic_info = json.loads(clean_text)
-                    for key in ["Paper Title", "Authors", "Year of Publication"]:
-                        if key in basic_info and basic_info[key] != "Not explicitly mentioned":
-                            extracted_info[key] = basic_info[key]
-                except json.JSONDecodeError as je:
-                    logger.error(f"JSON decode error for basic info in {filename}: {str(je)}")
-                    logger.error(f"Problematic JSON string: {clean_text}")
-        except Exception as e:
-            logger.error(f"Error extracting basic info for {filename}: {str(e)}")
-        
-        # Split text into smaller chunks for detailed analysis
+        basic_info_response = call_deepseek_api(basic_info_prompt)
+        if basic_info_response:
+            clean_text = re.sub(r'^[^{]*', '', basic_info_response)
+            clean_text = re.sub(r'[^}]*$', '', clean_text)
+            
+            try:
+                basic_info = json.loads(clean_text)
+                for key in ["Paper Title", "Authors", "Year of Publication"]:
+                    extracted_info[key] = basic_info.get(key, "Not explicitly mentioned")
+            except json.JSONDecodeError:
+                logger.error(f"JSON decode error for basic info in {filename}")
+
+        # Process text chunks
         max_chars = 15000
-        text_chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+        text_chunks = [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
         
-        # Process each chunk for detailed information
         for chunk_index, chunk in enumerate(text_chunks):
-            logger.info(f"Processing chunk {chunk_index + 1}/{len(text_chunks)} for {filename}")
+            logger.info(f"Processing chunk {chunk_index+1}/{len(text_chunks)} for {filename}")
             
             detail_prompt = f"""
-            Analyze this portion of a research paper and extract specific information.
-            
-            RESPOND ONLY WITH THIS EXACT JSON STRUCTURE:
+            Analyze this research paper chunk and extract information. Respond with JSON using:
             {{
-                "Meta-Learning Method Used": "description or 'Not explicitly mentioned'",
-                "Meta-Features Chosen": "description or 'Not explicitly mentioned'",
-                "Algorithm Selection Method": "description or 'Not explicitly mentioned'",
-                "Algorithms Considered for Selection": "description or 'Not explicitly mentioned'",
-                "Evaluation Metrics": "description or 'Not explicitly mentioned'",
-                "Dataset(s) Used": "description or 'Not explicitly mentioned'",
-                "Performance of Meta-Learning Approach": "description or 'Not explicitly mentioned'",
-                "Key Findings/Contributions": "description or 'Not explicitly mentioned'",
-                "Meta-Feature Generation Process": "description or 'Not explicitly mentioned'",
-                "Limitations": "description or 'Not explicitly mentioned'"
+                "Meta-Learning Method Used": "description",
+                "Meta-Features Chosen": "description",
+                "Algorithm Selection Method": "description",
+                "Algorithms Considered": "list",
+                "Evaluation Metrics": "list",
+                "Datasets Used": "list",
+                "Performance": "description",
+                "Key Contributions": "description",
+                "Meta-Feature Generation": "description",
+                "Limitations": "description"
             }}
-
-            Text to analyze (chunk {chunk_index + 1} of {len(text_chunks)}):
+            Chunk content:
             {chunk}
-
-            IMPORTANT:
-            1. DO NOT include any other text or explanation
-            2. ONLY the JSON object is allowed in your response
-            3. ALL property names MUST be exactly as shown above
-            4. Use double quotes for ALL strings
-            5. NO trailing commas
-            6. If information is not found, use "Not explicitly mentioned"
             """
             
             try:
-                response = call_gemini_api(detail_prompt)
-                if response and hasattr(response, 'text'):
-                    # Clean and parse the response
-                    clean_text = response.text.strip()
-                    clean_text = re.sub(r'^[^{]*', '', clean_text)  # Remove any text before {
-                    clean_text = re.sub(r'[^}]*$', '', clean_text)  # Remove any text after }
+                chunk_response = call_deepseek_api(detail_prompt)
+                if chunk_response:
+                    clean_text = re.sub(r'^[^{]*', '', chunk_response)
+                    clean_text = re.sub(r'[^}]*$', '', clean_text)
                     
                     try:
-                        result = json.loads(clean_text)
-                        
-                        # Update extracted_info with non-empty values
-                        for key, value in result.items():
-                            if key in extracted_info and value != "Not explicitly mentioned":
-                                if extracted_info[key] == "Not explicitly mentioned":
-                                    extracted_info[key] = value
-                                else:
-                                    # Combine new information
-                                    current_info = set(extracted_info[key].split('; '))
-                                    new_info = set(value.split('; '))
-                                    combined_info = current_info.union(new_info)
-                                    extracted_info[key] = '; '.join(sorted(filter(None, combined_info)))
-                    
-                    except json.JSONDecodeError as je:
-                        logger.error(f"JSON decode error for chunk {chunk_index + 1} in {filename}: {str(je)}")
-                        logger.error(f"Problematic JSON string: {clean_text}")
-                        continue
-            
+                        chunk_data = json.loads(clean_text)
+                        for key in chunk_data:
+                            if chunk_data[key] and chunk_data[key] != "Not explicitly mentioned":
+                                extracted_info[key] = '; '.join(filter(None, [
+                                    extracted_info[key],
+                                    chunk_data[key]
+                                ])).strip('; ')
+                    except json.JSONDecodeError:
+                        logger.error(f"JSON error in chunk {chunk_index+1}")
+
             except Exception as chunk_error:
-                logger.error(f"Error processing chunk {chunk_index + 1} for {filename}: {str(chunk_error)}")
-                continue
-        
-        # Generate a summary if we have enough information
-        if any(extracted_info[key] != "Not explicitly mentioned" for key in extracted_info.keys()):
-            summary_prompt = f"""
-            Create a brief summary of this research paper based on these extracted details.
-            
-            Paper information:
-            {json.dumps(extracted_info, indent=2)}
-            
-            RESPOND WITH A SINGLE PARAGRAPH:
-            1. Focus on the main contribution, method, and key findings
-            2. Keep it concise (2-3 sentences)
-            3. Use clear, academic language
-            4. Do not include any JSON formatting
-            """
-            
-            try:
-                summary_response = call_gemini_api(summary_prompt)
-                if summary_response and hasattr(summary_response, 'text'):
-                    extracted_info["Simple Summary"] = summary_response.text.strip()
-            except Exception as summary_error:
-                logger.error(f"Error generating summary for {filename}: {str(summary_error)}")
-        
-        # Generate IEEE citation if needed
-        if all(extracted_info[k] != "Not explicitly mentioned" for k in ["Paper Title", "Authors", "Year of Publication"]):
-            extracted_info["IEEE Citation"] = generate_ieee_citation(
-                extracted_info["Paper Title"],
-                extracted_info["Authors"],
-                extracted_info["Year of Publication"]
-            )
-        
+                logger.error(f"Chunk processing error: {str(chunk_error)}")
+
+        # Generate summary
+        summary_prompt = f"""
+        Create a concise 3-sentence summary of this research paper:
+        {json.dumps(extracted_info, indent=2)}
+        Focus on key contributions and methodology.
+        """
+        extracted_info["Simple Summary"] = call_deepseek_api(summary_prompt)
+
+        # Generate citation
+        extracted_info["IEEE Citation"] = generate_ieee_citation(
+            extracted_info["Paper Title"],
+            extracted_info["Authors"],
+            extracted_info["Year of Publication"]
+        )
+
         return extracted_info
-    
+
     except Exception as e:
-        logger.error(f"Error in Gemini API processing for {filename}: {str(e)}")
+        logger.error(f"Processing failed for {filename}: {str(e)}")
         extracted_info["extraction_status"] = "error"
         extracted_info["error_message"] = str(e)
         return extracted_info
 
 def generate_ieee_citation(title: str, authors: str, year: str) -> str:
     """Generate IEEE citation from extracted information."""
-    if title != "Not explicitly mentioned" and authors != "Not explicitly mentioned" and year != "Not explicitly mentioned":
-        # Clean up authors (take first 3 if many)
+    if all([title, authors, year]):
         author_list = [a.strip() for a in authors.split(',')]
-        if len(author_list) > 3:
-            author_list = author_list[:3]
-            author_text = ', '.join(author_list) + ', et al.'
-        else:
-            author_text = authors
-        
-        # Clean up title
-        clean_title = title.strip('"').strip("'")
-        
-        return f"{author_text}, \"{clean_title},\" in Meta-Learning Research, {year}."
-    
+        author_text = ', '.join(author_list[:3]) + (' et al.' if len(author_list) > 3 else '')
+        return f'{author_text}, "{title.strip()}", in Proc. Meta-Learning Conf., {year}.'
     return "Not explicitly mentioned"
 
-class BERTEncoder(nn.Module):
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
-        
-    def mean_pooling(self, model_output, attention_mask):
-        token_embeddings = model_output[0]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-    
-    def forward(self, texts: List[str]) -> torch.Tensor:
-        # Tokenize sentences
-        encoded_input = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
-        
-        # Compute token embeddings
-        with torch.no_grad():
-            model_output = self.model(**encoded_input)
-        
-        # Perform pooling
-        sentence_embeddings = self.mean_pooling(model_output, encoded_input['attention_mask'])
-        
-        # Normalize embeddings
-        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
-        
-        return sentence_embeddings
-
-def create_feature_vector(paper_info: dict) -> str:
-    """Create a text representation for clustering."""
-    features = [
-        paper_info.get("Paper Title", ""),
-        paper_info.get("Meta-Learning Method Used", ""),
-        paper_info.get("Meta-Features Chosen", ""),
-        paper_info.get("Algorithm Selection Method", ""),
-        paper_info.get("Algorithms Considered for Selection", ""),
-        paper_info.get("Dataset(s) Used", ""),
-        paper_info.get("Key Findings/Contributions", ""),
-        paper_info.get("Simple Summary", "")
-    ]
-    return " ".join([str(f) for f in features if f and f != "Not explicitly mentioned"])
-
-def compute_similarity_matrix(embeddings: torch.Tensor) -> torch.Tensor:
-    """Compute cosine similarity matrix between embeddings."""
-    return torch.mm(embeddings, embeddings.t())
-
-def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
-    """
-    Cluster papers based on their content using BERT embeddings.
-    
-    Args:
-        papers_df: DataFrame containing paper information
-        n_clusters: Number of clusters to create
-        
-    Returns:
-        DataFrame with added clustering information
-    """
-    try:
-        # Create feature vectors for clustering
-        feature_texts = [create_feature_vector(row.to_dict()) for _, row in papers_df.iterrows()]
-        
-        # Initialize BERT encoder
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        encoder = BERTEncoder().to(device)
-        encoder.eval()
-        
-        # Generate embeddings in batches
-        batch_size = 32
-        embeddings_list = []
-        
-        for i in range(0, len(feature_texts), batch_size):
-            batch_texts = feature_texts[i:i + batch_size]
-            with torch.no_grad():
-                batch_embeddings = encoder(batch_texts)
-            embeddings_list.append(batch_embeddings)
-        
-        # Concatenate all embeddings
-        embeddings = torch.cat(embeddings_list, dim=0)
-        
-        # Move to CPU for clustering
-        embeddings_np = embeddings.cpu().numpy()
-        
-        if embeddings_np.shape[0] < n_clusters:
-            n_clusters = max(2, embeddings_np.shape[0] - 1)
-        
-        # Perform clustering
-        kmeans = KMeans(
-            n_clusters=n_clusters,
-            random_state=42,
-            n_init=10
-        )
-        cluster_labels = kmeans.fit_predict(embeddings_np)
-        
-        # Add cluster labels to DataFrame
-        papers_df['Cluster'] = cluster_labels
-        
-        # Compute cluster centroids and similarities
-        centroids = kmeans.cluster_centers_
-        centroid_embeddings = torch.from_numpy(centroids).to(device)
-        paper_embeddings = torch.from_numpy(embeddings_np).to(device)
-        
-        # Generate cluster descriptions
-        cluster_descriptions = {}
-        for cluster_id in range(n_clusters):
-            # Get papers in this cluster
-            cluster_papers = papers_df[papers_df['Cluster'] == cluster_id]
-            
-            # Compute similarities to centroid
-            similarities = F.cosine_similarity(
-                paper_embeddings[cluster_papers.index],
-                centroid_embeddings[cluster_id].unsqueeze(0)
-            )
-            
-            # Get most representative papers (closest to centroid)
-            representative_indices = similarities.argsort(descending=True)[:3]
-            representative_papers = cluster_papers.iloc[representative_indices.cpu().numpy()]
-            
-            # Prepare cluster summary for Gemini
-            cluster_summary = {
-                "papers": representative_papers[["Paper Title", "Meta-Learning Method Used", "Key Findings/Contributions"]].to_dict('records'),
-                "size": len(cluster_papers),
-                "representative_papers": representative_papers["Paper Title"].tolist()
-            }
-            
-            # Generate cluster description using Gemini
-            description_prompt = f"""
-            Analyze these related papers and provide a short theme description.
-
-            Papers in cluster:
-            {json.dumps(cluster_summary, indent=2)}
-
-            Provide a concise (1-2 sentences) description that captures the common theme or approach among these papers.
-            Focus on the shared methodological or conceptual elements.
-            """
-            
-            try:
-                response = call_gemini_api(description_prompt)
-                if response and hasattr(response, 'text'):
-                    cluster_descriptions[cluster_id] = response.text.strip()
-                else:
-                    cluster_descriptions[cluster_id] = f"Cluster {cluster_id + 1}"
-            except Exception as e:
-                logger.error(f"Error generating description for cluster {cluster_id}: {str(e)}")
-                cluster_descriptions[cluster_id] = f"Cluster {cluster_id + 1}"
-        
-        # Add cluster descriptions to DataFrame
-        papers_df['Cluster Description'] = papers_df['Cluster'].map(cluster_descriptions)
-        
-        # Visualize clusters using t-SNE
-        try:
-            from sklearn.manifold import TSNE
-            
-            # Reduce dimensions for visualization
-            tsne = TSNE(n_components=2, random_state=42)
-            coords = tsne.fit_transform(embeddings_np)
-            
-            # Create scatter plot
-            plt.figure(figsize=(12, 8))
-            scatter = plt.scatter(coords[:, 0], coords[:, 1], c=cluster_labels, cmap='viridis')
-            plt.title('Paper Clusters Visualization (t-SNE)')
-            plt.xlabel('First t-SNE Component')
-            plt.ylabel('Second t-SNE Component')
-            
-            # Add legend with cluster descriptions
-            legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                        markerfacecolor=scatter.cmap(scatter.norm(i)), 
-                                        label=f'Cluster {i + 1}: {desc[:50]}...' if len(desc) > 50 else desc,
-                                        markersize=10)
-                             for i, desc in cluster_descriptions.items()]
-            plt.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-            # Save plot
-            plt.tight_layout()
-            plt.savefig('paper_clusters.png', bbox_inches='tight', dpi=300)
-            plt.close()
-            
-        except Exception as e:
-            logger.error(f"Error creating cluster visualization: {str(e)}")
-        
-        return papers_df
-        
-    except Exception as e:
-        logger.error(f"Error in clustering: {str(e)}")
-        papers_df['Cluster'] = 0
-        papers_df['Cluster Description'] = "Clustering failed"
-        return papers_df
-
-def analyze_clusters(papers_df: pd.DataFrame) -> dict:
-    """
-    Analyze the clusters to identify patterns and trends.
-    
-    Args:
-        papers_df: DataFrame with clustering information
-        
-    Returns:
-        Dictionary containing cluster analysis
-    """
-    analysis = defaultdict(dict)
-    
-    try:
-        for cluster_id in papers_df['Cluster'].unique():
-            cluster_papers = papers_df[papers_df['Cluster'] == cluster_id]
-            
-            # Prepare cluster analysis
-            cluster_info = {
-                "size": len(cluster_papers),
-                "papers": cluster_papers[["Paper Title", "Authors", "Year of Publication", 
-                                        "Meta-Learning Method Used", "Key Findings/Contributions"]].to_dict('records'),
-                "description": cluster_papers['Cluster Description'].iloc[0]
-            }
-            
-            # Generate detailed analysis using Gemini
-            analysis_prompt = f"""
-            Analyze this cluster of related meta-learning papers and provide insights.
-
-            Cluster Information:
-            {json.dumps(cluster_info, indent=2)}
-
-            Provide a detailed analysis that covers:
-            1. Common methodological approaches
-            2. Shared research goals or problems addressed
-            3. Evolution of ideas within this group
-            4. Key contributions and findings
-            5. Potential future directions
-
-            Format your response as a cohesive academic paragraph.
-            """
-            
-            try:
-                response = call_gemini_api(analysis_prompt)
-                if response and hasattr(response, 'text'):
-                    analysis[f"Cluster {cluster_id}"] = {
-                        "description": cluster_info["description"],
-                        "size": cluster_info["size"],
-                        "detailed_analysis": response.text.strip()
-                    }
-                else:
-                    analysis[f"Cluster {cluster_id}"] = {
-                        "description": cluster_info["description"],
-                        "size": cluster_info["size"],
-                        "detailed_analysis": "Analysis generation failed"
-                    }
-            except Exception as e:
-                logger.error(f"Error generating analysis for cluster {cluster_id}: {str(e)}")
-                analysis[f"Cluster {cluster_id}"] = {
-                    "description": cluster_info["description"],
-                    "size": cluster_info["size"],
-                    "detailed_analysis": f"Error in analysis: {str(e)}"
-                }
-    
-    except Exception as e:
-        logger.error(f"Error in cluster analysis: {str(e)}")
-        analysis["error"] = str(e)
-    
-    return dict(analysis)
 
 def process_papers(input_folder: str, output_folder: str) -> None:
     """Process all PDF papers and generate analysis."""
@@ -587,7 +282,7 @@ def process_papers(input_folder: str, output_folder: str) -> None:
                 logger.warning(f"Could not extract text from {pdf_path.name}")
                 continue
             
-            extracted_info = extract_paper_info_with_gemini(text, pdf_path.name)
+            extracted_info = extract_paper_info(text, pdf_path.name)
             results.append(extracted_info)
             
             # Save intermediate results after each paper
@@ -610,13 +305,9 @@ def process_papers(input_folder: str, output_folder: str) -> None:
             # Create DataFrame and perform clustering
             df = pd.DataFrame(results)
             
-            # Perform clustering
+            # Perform clustering using the standalone module
             logger.info("Performing paper clustering...")
-            df_with_clusters = cluster_papers(df)
-            
-            # Generate cluster analysis
-            logger.info("Analyzing clusters...")
-            cluster_analysis = analyze_clusters(df_with_clusters)
+            df_with_clusters, cluster_analysis = cluster_papers(df)
             
             # Save results
             output_file = os.path.join(output_folder, "meta_learning_related_work.csv")
@@ -624,8 +315,7 @@ def process_papers(input_folder: str, output_folder: str) -> None:
             
             # Save cluster analysis
             analysis_file = os.path.join(output_folder, "cluster_analysis.json")
-            with open(analysis_file, 'w', encoding='utf-8') as f:
-                json.dump(cluster_analysis, f, indent=2)
+            save_cluster_analysis(cluster_analysis, analysis_file)
             
             logger.info(f"Results saved to {output_folder}")
             logger.info(f"Cluster analysis saved to {analysis_file}")

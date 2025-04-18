@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Configure paths
 WORKSPACE_ROOT = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(WORKSPACE_ROOT, "output")
-DEFAULT_INPUT_CSV = os.path.join(OUTPUT_DIR, "meta_learning_related_work.csv")
+DEFAULT_INPUT_CSV = os.path.join(OUTPUT_DIR, "meta_learning_related_work_clustered.csv")
 DEFAULT_OUTPUT_FILE = os.path.join(OUTPUT_DIR, "literature_review.md")
 
 # Rate limiting configuration
@@ -33,87 +33,67 @@ RATE_LIMIT_DELAY = 3  # Delay between API calls in seconds
 MAX_RETRIES = 4  # Maximum number of retries for API calls
 RETRY_DELAY = 10  # Delay between retries in seconds
 
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+import os
+import time
+import logging
+import openai
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Constants
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+RATE_LIMIT_DELAY = 1  # seconds
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Configure DeepSeek API
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    raise ValueError("DEEPSEEK_API_KEY not found in environment variables. Please check your .env file.")
+
+openai.api_key = DEEPSEEK_API_KEY
+openai.api_base = "https://api.deepseek.com/v1"  # DeepSeek's OpenAI-compatible endpoint
+
+# Model and generation configuration
+MODEL_NAME = "deepseek-chat"
+GENERATION_CONFIG = {
+    "temperature": 0.3,
+    "top_p": 0.8,
+    "max_tokens": 2048,
+}
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=RETRY_DELAY))
-def call_gemini_api(prompt, generation_config, safety_settings):
+def call_gemini_api(prompt, generation_config=None):
     """
-    Call Gemini API with retry logic and rate limiting.
+    Call DeepSeek API with retry logic and rate limiting.
     """
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
+        messages = [{"role": "user", "content": prompt}]
+        config = generation_config or GENERATION_CONFIG
+
+        response = openai.ChatCompletion.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=config.get("temperature", 0.7),
+            top_p=config.get("top_p", 1.0),
+            max_tokens=config.get("max_tokens", 2048)
         )
-        time.sleep(RATE_LIMIT_DELAY)  # Rate limiting delay
-        return response
+        time.sleep(RATE_LIMIT_DELAY)
+        return response["choices"][0]["message"]["content"]
+
     except Exception as e:
         if "quota" in str(e).lower():
             logger.warning("API quota limit reached. Waiting before retry...")
-            time.sleep(RETRY_DELAY)  # Wait longer for quota issues
+            time.sleep(RETRY_DELAY)
             raise  # Retry through decorator
         raise
 
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    
-    # Initialize the model with specific configuration
-    model = genai.GenerativeModel('gemini-1.5-pro')
-    
-    # Define generation config for better academic content
-    GENERATION_CONFIG = {
-        "temperature": 0.3,  # More focused and precise
-        "top_p": 0.8,
-        "top_k": 40,
-        "max_output_tokens": 2048,  # Maximum output size
-    }
-    
-    # Define safety settings for academic content
-    SAFETY_SETTINGS = [
-        {
-            "category": "HARM_CATEGORY_HARASSMENT",
-            "threshold": "BLOCK_NONE",
-        },
-        {
-            "category": "HARM_CATEGORY_HATE_SPEECH",
-            "threshold": "BLOCK_NONE",
-        },
-        {
-            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-            "threshold": "BLOCK_NONE",
-        },
-        {
-            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_NONE",
-        },
-    ]
-    
-    logger.info("Successfully initialized Gemini API")
-    
-    # Test the model with configuration
-    test_response = call_gemini_api(
-        "Test connection",
-        GENERATION_CONFIG,
-        SAFETY_SETTINGS
-    )
-    if not test_response or not hasattr(test_response, 'text'):
-        raise Exception("Failed to get valid response from Gemini API")
-    logger.info("Successfully tested Gemini API connection")
-    
-except Exception as e:
-    logger.error(f"Error configuring Gemini API: {str(e)}")
-    logger.error("Please check your API key and internet connection")
-    raise
 
 def ensure_output_dir():
-    """Ensure output directory exists."""
+    """Ensure the output directory exists."""
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        logger.info(f"Using output directory: {OUTPUT_DIR}")
     except Exception as e:
         logger.error(f"Error creating output directory: {str(e)}")
         raise
@@ -127,7 +107,7 @@ def load_papers_data(csv_path: str = DEFAULT_INPUT_CSV) -> pd.DataFrame:
         if not os.path.exists(abs_path):
             raise FileNotFoundError(
                 f"CSV file not found at: {abs_path}\n"
-                f"Please ensure 'meta_learning_related_work.csv' exists in the output folder: {OUTPUT_DIR}"
+                f"Please ensure 'meta_learning_related_work_clustered.csv' exists in the output folder: {OUTPUT_DIR}"
             )
         
         logger.info(f"Reading CSV file from: {abs_path}")
@@ -140,7 +120,7 @@ def load_papers_data(csv_path: str = DEFAULT_INPUT_CSV) -> pd.DataFrame:
             "Evaluation Metrics", "Dataset(s) Used",
             "Performance of Meta-Learning Approach", "Key Findings/Contributions",
             "Meta-Feature Generation Process", "Limitations",
-            "Simple Summary", "IEEE Citation"
+            "Simple Summary", "IEEE Citation", "Cluster", "Cluster Description"
         ]
         
         missing_columns = [col for col in required_columns if col not in df.columns]
@@ -161,53 +141,35 @@ def load_papers_data(csv_path: str = DEFAULT_INPUT_CSV) -> pd.DataFrame:
         logger.error(f"Error loading CSV file: {str(e)}")
         raise
 
-def group_papers_by_themes(df: pd.DataFrame) -> Dict[str, List[Dict]]:
-    """Group papers by different themes for analysis."""
-    themes = {
-        "meta_learning_methods": defaultdict(list),
-        "algorithm_selection": defaultdict(list),
-        "dataset_types": defaultdict(list),
-        "publication_years": defaultdict(list)
-    }
+def group_papers_by_clusters(df: pd.DataFrame) -> Dict[str, List[Dict]]:
+    """Group papers by their clusters."""
+    clusters = defaultdict(list)
     
     for _, paper in df.iterrows():
-        # Group by meta-learning methods
-        if paper["Meta-Learning Method Used"] != "Not explicitly mentioned":
-            themes["meta_learning_methods"][paper["Meta-Learning Method Used"]].append(paper.to_dict())
-            
-        # Group by algorithm selection methods
-        if paper["Algorithm Selection Method"] != "Not explicitly mentioned":
-            themes["algorithm_selection"][paper["Algorithm Selection Method"]].append(paper.to_dict())
-            
-        # Group by dataset types
-        if paper["Dataset(s) Used"] != "Not explicitly mentioned":
-            themes["dataset_types"][paper["Dataset(s) Used"]].append(paper.to_dict())
-            
-        # Group by publication years
-        if paper["Year of Publication"] != "Not explicitly mentioned":
-            themes["publication_years"][paper["Year of Publication"]].append(paper.to_dict())
+        cluster_id = paper["Cluster"]
+        clusters[f"cluster_{cluster_id}"].append(paper.to_dict())
     
-    return themes
+    return clusters
 
-def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) -> str:
-    """Generate analysis for a specific theme using Gemini."""
+def generate_cluster_analysis(cluster_id: str, cluster_data: List[Dict]) -> str:
+    """Generate analysis for a specific cluster using Gemini."""
     try:
-        # Create a structured representation of the theme data
-        theme_summary = json.dumps(theme_data, indent=2)
+        # Create a structured representation of the cluster data
+        cluster_summary = json.dumps(cluster_data, indent=2)
         
         prompt = f"""
-        You are an expert researcher in meta-learning. Write a comprehensive analysis of the papers grouped under the theme "{theme_name}".
+        You are an expert researcher in meta-learning. Write a comprehensive analysis of the papers in {cluster_id}.
         
         Focus on:
-        1. Key patterns and trends in the research
-        2. Comparison of different approaches
+        1. Common themes and patterns in the research
+        2. Key methodologies and approaches
         3. Major findings and their significance
         4. Current limitations and future research directions
         
         Use proper academic writing style and include IEEE-style citations [n].
         
         Papers to analyze:
-        {theme_summary}
+        {cluster_summary}
         
         IMPORTANT INSTRUCTIONS:
         1. Write a cohesive paragraph that flows logically
@@ -221,7 +183,7 @@ def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) 
         """
         
         try:
-            response = call_gemini_api(prompt, GENERATION_CONFIG, SAFETY_SETTINGS)
+            response = call_gemini_api(prompt)
             if response and hasattr(response, 'text'):
                 # Clean up the response
                 analysis = response.text.strip()
@@ -232,158 +194,130 @@ def generate_theme_analysis(theme_name: str, theme_data: Dict[str, List[Dict]]) 
             else:
                 raise ValueError("Invalid response format from Gemini API")
         except Exception as api_error:
-            logger.error(f"Gemini API error for theme {theme_name}: {str(api_error)}")
-            return f"Error analyzing theme {theme_name}: API error - {str(api_error)}"
+            logger.error(f"Gemini API error for cluster {cluster_id}: {str(api_error)}")
+            return f"Error analyzing cluster {cluster_id}: API error - {str(api_error)}"
             
     except Exception as e:
-        logger.error(f"Error generating theme analysis: {str(e)}")
-        return f"Error analyzing theme {theme_name}: {str(e)}"
+        logger.error(f"Error generating cluster analysis: {str(e)}")
+        return f"Error analyzing cluster {cluster_id}: {str(e)}"
 
 def generate_literature_review(df: pd.DataFrame) -> Dict[str, str]:
-    """Generate a complete literature review with different sections."""
+    """Generate a structured literature review from the clustered paper data."""
+    sections = {}
+    
     try:
-        # Group papers by themes
-        themed_papers = group_papers_by_themes(df)
+        # Group papers by clusters
+        clusters = group_papers_by_clusters(df)
         
-        # Convert DataFrame to a format suitable for the prompt
-        papers_json = df.to_json(orient='records', indent=2)
-        
-        # Generate introduction with rate limiting
+        # Generate introduction
         intro_prompt = f"""
-        Write an academic introduction for a literature review on meta-learning approaches in algorithm selection.
+        Write an introduction for a literature review on meta-learning research.
         
-        Use this paper data to inform your writing:
-        {papers_json}
+        Focus on:
+        1. The importance of meta-learning in machine learning
+        2. The scope of this review
+        3. The structure of the review
         
-        Your introduction MUST:
-        1. Define the scope and objective clearly
-        2. Provide context about meta-learning and algorithm selection
-        3. Outline the structure of the review
-        4. Highlight the significance of this research area
-        
-        IMPORTANT GUIDELINES:
-        1. Use formal academic writing style
-        2. Be concise but comprehensive
-        3. Avoid unnecessary jargon
-        4. Start directly with the content
-        5. Focus on clarity and flow
-        6. No need for abstract or keywords
-        
-        Begin your introduction directly without any preamble.
+        Use proper academic writing style.
         """
         
         try:
-            response = call_gemini_api(intro_prompt, GENERATION_CONFIG, SAFETY_SETTINGS)
+            response = call_gemini_api(intro_prompt)
             if response and hasattr(response, 'text'):
-                introduction = response.text.strip()
-                if not introduction:
-                    introduction = "Error: Empty introduction generated"
+                sections["introduction"] = response.text.strip()
             else:
-                introduction = "Error: Invalid API response format"
-            logger.info("Successfully generated introduction")
-        except Exception as api_error:
-            logger.error(f"Error generating introduction: {str(api_error)}")
-            introduction = f"Error generating introduction: {str(api_error)}"
+                sections["introduction"] = "Error generating introduction."
+        except Exception as e:
+            logger.error(f"Error generating introduction: {str(e)}")
+            sections["introduction"] = "Error generating introduction."
         
-        # Generate themed sections with rate limiting
-        sections = {
-            "Introduction": introduction
-        }
+        # Generate sections for each cluster
+        for cluster_id, cluster_data in clusters.items():
+            if cluster_data:
+                section_title = f"Cluster {cluster_id.split('_')[1]}"
+                sections[cluster_id] = generate_cluster_analysis(section_title, cluster_data)
         
-        # Process each theme with delays between calls
-        theme_sections = [
-            ("Evolution of Meta-Learning Methods", "Evolution of Meta-Learning", themed_papers["meta_learning_methods"]),
-            ("Algorithm Selection Strategies", "Algorithm Selection", themed_papers["algorithm_selection"]),
-            ("Datasets and Evaluation", "Datasets and Evaluation", themed_papers["dataset_types"]),
-            ("Trends and Future Directions", "Trends", themed_papers["publication_years"])
-        ]
-        
-        for section_title, theme_name, theme_data in theme_sections:
-            logger.info(f"Generating section: {section_title}")
-            sections[section_title] = generate_theme_analysis(theme_name, theme_data)
-            time.sleep(RATE_LIMIT_DELAY)
-        
-        # Generate conclusion with rate limiting
+        # Generate conclusion
         conclusion_prompt = f"""
-        Write a conclusion for this meta-learning literature review.
+        Write a conclusion for a literature review on meta-learning research.
         
-        Previous sections:
-        {json.dumps(sections, indent=2)}
+        Focus on:
+        1. Summary of key findings
+        2. Current state of the field
+        3. Future research directions
         
-        Your conclusion MUST:
-        1. Summarize the key findings and patterns
-        2. Identify important research gaps
-        3. Suggest specific future research directions
-        4. Emphasize the field's significance
-        
-        IMPORTANT GUIDELINES:
-        1. Use formal academic style
-        2. Be concise but comprehensive
-        3. Make clear recommendations
-        4. Connect back to the introduction
-        5. End with a strong closing statement
-        
-        Begin your conclusion directly without any preamble.
+        Use proper academic writing style.
         """
         
         try:
-            response = call_gemini_api(conclusion_prompt, GENERATION_CONFIG, SAFETY_SETTINGS)
+            response = call_gemini_api(conclusion_prompt)
             if response and hasattr(response, 'text'):
-                conclusion = response.text.strip()
-                if not conclusion:
-                    conclusion = "Error: Empty conclusion generated"
+                sections["conclusion"] = response.text.strip()
             else:
-                conclusion = "Error: Invalid API response format"
-            logger.info("Successfully generated conclusion")
-        except Exception as api_error:
-            logger.error(f"Error generating conclusion: {str(api_error)}")
-            conclusion = f"Error generating conclusion: {str(api_error)}"
+                sections["conclusion"] = "Error generating conclusion."
+        except Exception as e:
+            logger.error(f"Error generating conclusion: {str(e)}")
+            sections["conclusion"] = "Error generating conclusion."
         
-        sections["Conclusion"] = conclusion
         return sections
     
     except Exception as e:
         logger.error(f"Error generating literature review: {str(e)}")
-        raise
+        return {"error": str(e)}
 
 def format_ieee_references(df: pd.DataFrame) -> str:
-    """Format IEEE citations in the correct order."""
+    """Format IEEE references from the paper data."""
     try:
-        # Extract and sort citations
-        citations = df["IEEE Citation"].tolist()
-        citations = [c for c in citations if c != "Not explicitly mentioned"]
+        # Filter out papers without proper citation information
+        valid_citations = df[df["IEEE Citation"] != "Not explicitly mentioned"]
         
-        # Number the citations
-        numbered_citations = [f"[{i+1}] {citation}" for i, citation in enumerate(citations)]
+        if valid_citations.empty:
+            return "No valid citations found."
         
-        return "\n\n".join(numbered_citations)
+        # Create numbered references
+        references = []
+        for i, (_, paper) in enumerate(valid_citations.iterrows(), 1):
+            citation = paper["IEEE Citation"]
+            if citation and citation != "Not explicitly mentioned":
+                references.append(f"[{i}] {citation}")
+        
+        return "\n\n".join(references)
+    
     except Exception as e:
-        logger.error(f"Error formatting references: {str(e)}")
-        return "Error generating references section"
+        logger.error(f"Error formatting IEEE references: {str(e)}")
+        return f"Error formatting references: {str(e)}"
 
-def save_literature_review(sections: Dict[str, str], references: str, output_path: str = DEFAULT_OUTPUT_FILE):
-    """Save the generated literature review to a file."""
+def save_literature_review(sections: Dict[str, str], references: str, output_file: str) -> None:
+    """Save the literature review to a markdown file."""
     try:
-        # Convert to absolute path if needed
-        abs_path = os.path.abspath(output_path)
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        
-        logger.info(f"Saving literature review to: {abs_path}")
-        with open(abs_path, 'w', encoding='utf-8') as f:
-            # Write each section
-            for section_title, content in sections.items():
-                f.write(f"# {section_title}\n\n")
-                f.write(f"{content}\n\n")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            # Write title
+            f.write("# Meta-Learning Literature Review\n\n")
+            
+            # Write introduction
+            f.write("## Introduction\n\n")
+            f.write(sections.get("introduction", "Introduction not available."))
+            f.write("\n\n")
+            
+            # Write cluster sections
+            for section_id, content in sections.items():
+                if section_id not in ["introduction", "conclusion"]:
+                    section_title = f"Cluster {section_id.split('_')[1]}"
+                    f.write(f"## {section_title}\n\n")
+                    f.write(content)
+                    f.write("\n\n")
+            
+            # Write conclusion
+            f.write("## Conclusion\n\n")
+            f.write(sections.get("conclusion", "Conclusion not available."))
+            f.write("\n\n")
             
             # Write references
-            f.write("# References\n\n")
+            f.write("## References\n\n")
             f.write(references)
-            
-    except PermissionError:
-        logger.error(f"Permission denied when writing to: {abs_path}")
-        raise
+        
+        logger.info(f"Literature review saved to {output_file}")
+    
     except Exception as e:
         logger.error(f"Error saving literature review: {str(e)}")
         raise
@@ -392,7 +326,7 @@ def main():
     parser = argparse.ArgumentParser(description='Generate a literature review from meta-learning papers data')
     parser.add_argument('--input', '-i', 
                       default=DEFAULT_INPUT_CSV,
-                      help='Path to the input CSV file (default: output/meta_learning_related_work.csv)')
+                      help='Path to the input CSV file (default: output/meta_learning_related_work_clustered.csv)')
     parser.add_argument('--output', '-o',
                       default=DEFAULT_OUTPUT_FILE,
                       help='Path to save the literature review (default: output/literature_review.md)')
@@ -422,7 +356,7 @@ def main():
         
     except FileNotFoundError as e:
         logger.error(f"File not found error: {str(e)}")
-        logger.error("Please ensure you've run generate_table.py first to create the CSV file")
+        logger.error("Please ensure you've run run_clustering.py first to create the clustered CSV file")
         raise
     except PermissionError as e:
         logger.error(f"Permission error: {str(e)}")
