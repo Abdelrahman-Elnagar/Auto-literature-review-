@@ -12,12 +12,16 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from transformers import AutoTokenizer, AutoModel
+import torch
+from torch import nn
+import torch.nn.functional as F
+from typing import List, Dict, Any, Tuple
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -30,7 +34,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configure Gemini API
-GEMINI_API_KEY = "AIzaSyC_HrKoNXIEi-Eu7-xQjqRfsuzQjVyF0xI"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Model and generation configuration
@@ -64,10 +71,55 @@ SAFETY_SETTINGS = [
 model = genai.GenerativeModel('gemini-1.5-pro')
 
 # Rate limiting configuration
-RATE_LIMIT_DELAY = 1  # Delay between API calls in seconds (reduced from 2)
-MAX_RETRIES = 3  # Maximum number of retries for API calls
-INITIAL_RETRY_DELAY = 5  # Initial delay before first retry (in seconds)
-MAX_RETRY_DELAY = 20  # Maximum delay between retries (in seconds)
+RATE_LIMIT_DELAY = 1  # Reduced from 2 to 1 second
+MAX_RETRIES = 3  # Reduced from 5 to 3
+INITIAL_RETRY_DELAY = 5  # Reduced from 10 to 5 seconds
+MAX_RETRY_DELAY = 30  # Reduced from 60 to 30 seconds
+MAX_TOKENS_PER_MINUTE = 60000
+TOKEN_COUNT_PER_CALL = 1000
+BATCH_SIZE = 5  # Process papers in batches
+
+# Token tracking for rate limiting
+class TokenTracker:
+    def __init__(self, max_tokens_per_minute):
+        self.max_tokens_per_minute = max_tokens_per_minute
+        self.tokens_used = 0
+        self.last_reset_time = time.time()
+        self.lock = threading.Lock()
+        self.batch_tokens = 0  # Track tokens for current batch
+    
+    def can_make_request(self, estimated_tokens):
+        with self.lock:
+            current_time = time.time()
+            # Reset counter if a minute has passed
+            if current_time - self.last_reset_time >= 60:
+                self.tokens_used = 0
+                self.batch_tokens = 0
+                self.last_reset_time = current_time
+            
+            # Check if we can make the request
+            if self.tokens_used + estimated_tokens <= self.max_tokens_per_minute:
+                self.tokens_used += estimated_tokens
+                self.batch_tokens += estimated_tokens
+                return True
+            return False
+    
+    def wait_if_needed(self, estimated_tokens):
+        with self.lock:
+            if not self.can_make_request(estimated_tokens):
+                # Calculate wait time until next reset
+                wait_time = 60 - (time.time() - self.last_reset_time)
+                if wait_time > 0:
+                    logger.info(f"Token limit reached. Waiting {wait_time:.2f} seconds for reset...")
+                    time.sleep(wait_time)
+                    self.tokens_used = 0
+                    self.batch_tokens = 0
+                    self.last_reset_time = time.time()
+                    self.tokens_used += estimated_tokens
+                    self.batch_tokens += estimated_tokens
+
+# Initialize token tracker
+token_tracker = TokenTracker(MAX_TOKENS_PER_MINUTE)
 
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
@@ -76,23 +128,87 @@ MAX_RETRY_DELAY = 20  # Maximum delay between retries (in seconds)
 def call_gemini_api(prompt, generation_config=None, safety_settings=None):
     """
     Call Gemini API with optimized retry logic and rate limiting.
-    - Uses 1 second delay between normal calls
-    - Uses exponential backoff starting at 5 seconds for retries
-    - Maximum retry delay capped at 20 seconds
+    - Uses token-based rate limiting to avoid quota exhaustion
+    - Implements exponential backoff for retries
+    - Tracks token usage across calls
     """
     try:
+        # Estimate tokens in the prompt (rough approximation)
+        estimated_tokens = len(prompt.split()) * 1.3  # Rough estimate
+        
+        # Wait if we're approaching the token limit
+        token_tracker.wait_if_needed(estimated_tokens)
+        
+        # Make the API call
         response = model.generate_content(
             prompt,
             generation_config=generation_config or GENERATION_CONFIG,
             safety_settings=safety_settings or SAFETY_SETTINGS
         )
-        time.sleep(RATE_LIMIT_DELAY)  # Short delay between successful calls
+        
+        # Add a small delay between calls
+        time.sleep(RATE_LIMIT_DELAY)
         return response
     except Exception as e:
-        if "quota" in str(e).lower():
+        if "quota" in str(e).lower() or "resource exhausted" in str(e).lower():
             logger.warning(f"API quota limit reached. Retrying with exponential backoff (max {MAX_RETRY_DELAY}s)...")
+            # Force a longer wait on quota errors
+            time.sleep(MAX_RETRY_DELAY)
             raise  # Retry through decorator with exponential backoff
         raise
+
+def preprocess_paper_text(text: str) -> str:
+    """
+    Preprocess paper text to remove unnecessary content while preserving in-text citations.
+    
+    Args:
+        text: Raw text extracted from the PDF
+        
+    Returns:
+        Cleaned text with unnecessary sections removed but in-text citations preserved
+    """
+    if not text:
+        return ""
+    
+    # Create a copy of the text to avoid modifying the original
+    cleaned_text = text
+    
+    # Remove reference section (but keep in-text citations)
+    reference_patterns = [
+        r"(?i)references\s*\[?\d*\]?\s*$.*",  # References at the end
+        r"(?i)bibliography\s*\[?\d*\]?\s*$.*",  # Bibliography at the end
+        r"(?i)references\s*\[?\d*\]?\s*\n.*",  # References followed by newline
+        r"(?i)bibliography\s*\[?\d*\]?\s*\n.*",  # Bibliography followed by newline
+    ]
+    
+    for pattern in reference_patterns:
+        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
+    
+    # Remove acknowledgments section
+    ack_patterns = [
+        r"(?i)acknowledgments?\s*$.*",
+        r"(?i)acknowledgments?\s*\n.*",
+    ]
+    
+    for pattern in ack_patterns:
+        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
+    
+    # Remove appendix sections
+    appendix_patterns = [
+        r"(?i)appendix\s*[A-Za-z0-9]*\s*$.*",
+        r"(?i)appendix\s*[A-Za-z0-9]*\s*\n.*",
+    ]
+    
+    for pattern in appendix_patterns:
+        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL)
+    
+    # Remove excessive whitespace
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    
+    # Remove page numbers and headers/footers
+    cleaned_text = re.sub(r'\n\s*\d+\s*\n', '\n', cleaned_text)
+    
+    return cleaned_text.strip()
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
@@ -110,7 +226,10 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         for page in doc:
             text += page.get_text()
         doc.close()
-        return text.strip()
+        
+        # Preprocess the extracted text
+        cleaned_text = preprocess_paper_text(text)
+        return cleaned_text
     except Exception as e:
         logger.error(f"Error extracting text from {pdf_path}: {str(e)}")
         return ""
@@ -150,7 +269,7 @@ def extract_paper_info_with_gemini(text: str, filename: str) -> dict:
         }}
 
         Text to analyze:
-        {text[:5000]}
+        {text[:3000]}  # Reduced from 5000 to 3000 to save tokens
 
         DO NOT include any other text or explanation. ONLY the JSON object is allowed.
         """
@@ -175,12 +294,16 @@ def extract_paper_info_with_gemini(text: str, filename: str) -> dict:
             logger.error(f"Error extracting basic info for {filename}: {str(e)}")
         
         # Split text into smaller chunks for detailed analysis
-        max_chars = 15000
+        max_chars = 10000  # Reduced from 15000 to 10000 to save tokens
         text_chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
         
         # Process each chunk for detailed information
         for chunk_index, chunk in enumerate(text_chunks):
             logger.info(f"Processing chunk {chunk_index + 1}/{len(text_chunks)} for {filename}")
+            
+            # Add a longer delay between chunks to avoid rate limits
+            if chunk_index > 0:
+                time.sleep(RATE_LIMIT_DELAY * 2)
             
             detail_prompt = f"""
             Analyze this portion of a research paper and extract specific information.
@@ -209,6 +332,7 @@ def extract_paper_info_with_gemini(text: str, filename: str) -> dict:
             4. Use double quotes for ALL strings
             5. NO trailing commas
             6. If information is not found, use "Not explicitly mentioned"
+            7. Be concise - use short descriptions to save tokens
             """
             
             try:
@@ -299,21 +423,54 @@ def generate_ieee_citation(title: str, authors: str, year: str) -> str:
     
     return "Not explicitly mentioned"
 
+class BERTEncoder(nn.Module):
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        
+    def mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        # Tokenize sentences
+        encoded_input = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+        
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
+        
+        # Perform pooling
+        sentence_embeddings = self.mean_pooling(model_output, encoded_input['attention_mask'])
+        
+        # Normalize embeddings
+        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        
+        return sentence_embeddings
+
 def create_feature_vector(paper_info: dict) -> str:
     """Create a text representation for clustering."""
     features = [
+        paper_info.get("Paper Title", ""),
         paper_info.get("Meta-Learning Method Used", ""),
         paper_info.get("Meta-Features Chosen", ""),
         paper_info.get("Algorithm Selection Method", ""),
         paper_info.get("Algorithms Considered for Selection", ""),
         paper_info.get("Dataset(s) Used", ""),
         paper_info.get("Key Findings/Contributions", ""),
+        paper_info.get("Simple Summary", "")
     ]
     return " ".join([str(f) for f in features if f and f != "Not explicitly mentioned"])
 
+def compute_similarity_matrix(embeddings: torch.Tensor) -> torch.Tensor:
+    """Compute cosine similarity matrix between embeddings."""
+    return torch.mm(embeddings, embeddings.t())
+
 def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
     """
-    Cluster papers based on their content and methods.
+    Cluster papers based on their content using BERT embeddings.
     
     Args:
         papers_df: DataFrame containing paper information
@@ -322,22 +479,33 @@ def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame
     Returns:
         DataFrame with added clustering information
     """
-    # Create feature vectors for clustering
-    feature_texts = [create_feature_vector(row.to_dict()) for _, row in papers_df.iterrows()]
-    
-    # Convert text to TF-IDF vectors
-    vectorizer = TfidfVectorizer(
-        max_features=1000,
-        stop_words='english',
-        ngram_range=(1, 2)
-    )
-    
     try:
-        # Transform texts to TF-IDF vectors
-        tfidf_matrix = vectorizer.fit_transform(feature_texts)
+        # Create feature vectors for clustering
+        feature_texts = [create_feature_vector(row.to_dict()) for _, row in papers_df.iterrows()]
         
-        if tfidf_matrix.shape[0] < n_clusters:
-            n_clusters = max(2, tfidf_matrix.shape[0] - 1)
+        # Initialize BERT encoder
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        encoder = BERTEncoder().to(device)
+        encoder.eval()
+        
+        # Generate embeddings in batches
+        batch_size = 32
+        embeddings_list = []
+        
+        for i in range(0, len(feature_texts), batch_size):
+            batch_texts = feature_texts[i:i + batch_size]
+            with torch.no_grad():
+                batch_embeddings = encoder(batch_texts)
+            embeddings_list.append(batch_embeddings)
+        
+        # Concatenate all embeddings
+        embeddings = torch.cat(embeddings_list, dim=0)
+        
+        # Move to CPU for clustering
+        embeddings_np = embeddings.cpu().numpy()
+        
+        if embeddings_np.shape[0] < n_clusters:
+            n_clusters = max(2, embeddings_np.shape[0] - 1)
         
         # Perform clustering
         kmeans = KMeans(
@@ -345,10 +513,15 @@ def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame
             random_state=42,
             n_init=10
         )
-        cluster_labels = kmeans.fit_predict(tfidf_matrix)
+        cluster_labels = kmeans.fit_predict(embeddings_np)
         
         # Add cluster labels to DataFrame
         papers_df['Cluster'] = cluster_labels
+        
+        # Compute cluster centroids and similarities
+        centroids = kmeans.cluster_centers_
+        centroid_embeddings = torch.from_numpy(centroids).to(device)
+        paper_embeddings = torch.from_numpy(embeddings_np).to(device)
         
         # Generate cluster descriptions
         cluster_descriptions = {}
@@ -356,10 +529,21 @@ def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame
             # Get papers in this cluster
             cluster_papers = papers_df[papers_df['Cluster'] == cluster_id]
             
+            # Compute similarities to centroid
+            similarities = F.cosine_similarity(
+                paper_embeddings[cluster_papers.index],
+                centroid_embeddings[cluster_id].unsqueeze(0)
+            )
+            
+            # Get most representative papers (closest to centroid)
+            representative_indices = similarities.argsort(descending=True)[:3]
+            representative_papers = cluster_papers.iloc[representative_indices.cpu().numpy()]
+            
             # Prepare cluster summary for Gemini
             cluster_summary = {
-                "papers": cluster_papers[["Paper Title", "Meta-Learning Method Used", "Key Findings/Contributions"]].to_dict('records'),
-                "size": len(cluster_papers)
+                "papers": representative_papers[["Paper Title", "Meta-Learning Method Used", "Key Findings/Contributions"]].to_dict('records'),
+                "size": len(cluster_papers),
+                "representative_papers": representative_papers["Paper Title"].tolist()
             }
             
             # Generate cluster description using Gemini
@@ -386,18 +570,20 @@ def cluster_papers(papers_df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame
         # Add cluster descriptions to DataFrame
         papers_df['Cluster Description'] = papers_df['Cluster'].map(cluster_descriptions)
         
-        # Visualize clusters
+        # Visualize clusters using t-SNE
         try:
+            from sklearn.manifold import TSNE
+            
             # Reduce dimensions for visualization
-            pca = PCA(n_components=2)
-            coords = pca.fit_transform(tfidf_matrix.toarray())
+            tsne = TSNE(n_components=2, random_state=42)
+            coords = tsne.fit_transform(embeddings_np)
             
             # Create scatter plot
             plt.figure(figsize=(12, 8))
             scatter = plt.scatter(coords[:, 0], coords[:, 1], c=cluster_labels, cmap='viridis')
-            plt.title('Paper Clusters Visualization')
-            plt.xlabel('First Principal Component')
-            plt.ylabel('Second Principal Component')
+            plt.title('Paper Clusters Visualization (t-SNE)')
+            plt.xlabel('First t-SNE Component')
+            plt.ylabel('Second t-SNE Component')
             
             # Add legend with cluster descriptions
             legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
@@ -507,33 +693,41 @@ def process_papers(input_folder: str, output_folder: str) -> None:
     
     results = []
     
-    # Process each PDF file with progress tracking
-    for pdf_path in tqdm(pdf_files, desc="Processing papers"):
-        logger.info(f"Starting to process {pdf_path.name}")
+    # Process papers in batches
+    for i in range(0, len(pdf_files), BATCH_SIZE):
+        batch = pdf_files[i:i + BATCH_SIZE]
+        logger.info(f"Processing batch {i//BATCH_SIZE + 1}/{(len(pdf_files) + BATCH_SIZE - 1)//BATCH_SIZE}")
         
-        try:
-            text = extract_text_from_pdf(str(pdf_path))
-            if not text:
-                logger.warning(f"Could not extract text from {pdf_path.name}")
-                continue
+        # Process each PDF file in the batch
+        for pdf_path in tqdm(batch, desc=f"Processing batch {i//BATCH_SIZE + 1}"):
+            logger.info(f"Starting to process {pdf_path.name}")
             
-            extracted_info = extract_paper_info_with_gemini(text, pdf_path.name)
-            results.append(extracted_info)
-            
-            # Save intermediate results after each paper
             try:
-                df = pd.DataFrame(results)
-                output_file = os.path.join(output_folder, "meta_learning_related_work.csv")
-                df.to_csv(output_file, index=False)
-                logger.info(f"Saved intermediate results after processing {pdf_path.name}")
-            except Exception as save_error:
-                logger.error(f"Error saving intermediate results: {str(save_error)}")
-            
-            time.sleep(RATE_LIMIT_DELAY)
-            
-        except Exception as e:
-            logger.error(f"Error processing {pdf_path.name}: {str(e)}")
-            continue
+                text = extract_text_from_pdf(str(pdf_path))
+                if not text:
+                    logger.warning(f"Could not extract text from {pdf_path.name}")
+                    continue
+                
+                extracted_info = extract_paper_info_with_gemini(text, pdf_path.name)
+                results.append(extracted_info)
+                
+                # Save intermediate results after each paper
+                try:
+                    df = pd.DataFrame(results)
+                    output_file = os.path.join(output_folder, "meta_learning_related_work.csv")
+                    df.to_csv(output_file, index=False)
+                    logger.info(f"Saved intermediate results after processing {pdf_path.name}")
+                except Exception as save_error:
+                    logger.error(f"Error saving intermediate results: {str(save_error)}")
+                
+            except Exception as e:
+                logger.error(f"Error processing {pdf_path.name}: {str(e)}")
+                continue
+        
+        # Add a delay between batches instead of between individual papers
+        if i + BATCH_SIZE < len(pdf_files):
+            logger.info(f"Waiting between batches...")
+            time.sleep(RATE_LIMIT_DELAY * 2)
     
     if results:
         try:

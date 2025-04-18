@@ -1,6 +1,15 @@
 @echo off
 echo Starting the Related Work Automation Process...
 
+echo Step 0: Installing required dependencies...
+pip install -r requirements.txt
+if %ERRORLEVEL% NEQ 0 (
+    echo Error installing dependencies. Process stopped.
+    pause
+    exit /b %ERRORLEVEL%
+)
+
+echo.
 echo Step 1: Generating table from papers...
 python generate_table.py ./papers ./output
 if %ERRORLEVEL% NEQ 0 (
